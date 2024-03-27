@@ -17,11 +17,9 @@
 
 package kafka.server
 
-import java.util.{Optional, Properties}
-import java.util.concurrent.ExecutionException
-import kafka.utils.TestUtils
-import kafka.zk.{FeatureZNode, FeatureZNodeStatus, ZkVersion}
 import kafka.utils.TestUtils.waitUntilTrue
+import kafka.utils.{TestInfoUtils, TestUtils}
+import kafka.zk.{FeatureZNode, FeatureZNodeStatus, ZkVersion}
 import org.apache.kafka.clients.admin.{Admin, FeatureUpdate, UpdateFeaturesOptions, UpdateFeaturesResult}
 import org.apache.kafka.common.errors.InvalidRequestException
 import org.apache.kafka.common.feature.{Features, SupportedVersionRange}
@@ -31,9 +29,13 @@ import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.{UpdateFeaturesRequest, UpdateFeaturesResponse}
 import org.apache.kafka.common.utils.Utils
 import org.apache.kafka.server.common.MetadataVersion.{IBP_2_7_IV0, IBP_3_2_IV0}
+import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
-import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertNotEquals, assertNotNull, assertThrows, assertTrue}
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 
+import java.util.concurrent.ExecutionException
+import java.util.{Optional, Properties}
 import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 import scala.util.matching.Regex
@@ -58,7 +60,9 @@ class UpdateFeaturesTest extends BaseRequestTest {
     features: Features[SupportedVersionRange], targetServers: Set[KafkaServer]): Unit = {
     targetServers.foreach(s => {
       s.brokerFeatures.setSupportedFeatures(features)
-      s.zkClient.updateBrokerInfo(s.createBrokerInfo)
+      if (!isKRaftTest()) {
+        s.zkClient.updateBrokerInfo(s.createBrokerInfo)
+      }
     })
 
     // Wait until updates to all BrokerZNode supported features propagate to the controller.
@@ -92,6 +96,7 @@ class UpdateFeaturesTest extends BaseRequestTest {
     newVersion
   }
 
+  // todo?
   private def getFeatureZNode(): FeatureZNode = {
     val (mayBeFeatureZNodeBytes, version) = serverForId(0).get.zkClient.getDataAndVersion(FeatureZNode.path)
     assertNotEquals(version, ZkVersion.UnknownVersion)
@@ -117,7 +122,9 @@ class UpdateFeaturesTest extends BaseRequestTest {
                             expectedFinalizedFeatures: Map[String, Short],
                             expectedFinalizedFeaturesEpoch: Long,
                             expectedSupportedFeatures: Features[SupportedVersionRange]): Unit = {
-    assertEquals(expectedNode, getFeatureZNode())
+    if (!isKRaftTest()) {
+      assertEquals(expectedNode, getFeatureZNode())
+    }
     val featureMetadata = client.describeFeatures.featureMetadata.get
     assertEquals(expectedFinalizedFeatures, finalizedFeatures(featureMetadata.finalizedFeatures))
     assertEquals(expectedSupportedFeatures, supportedFeatures(featureMetadata.supportedFeatures))
@@ -151,30 +158,41 @@ class UpdateFeaturesTest extends BaseRequestTest {
                                                                        invalidUpdate: FeatureUpdate,
                                                                        exceptionMsgPattern: Regex)
                                                                       (implicit tag: ClassTag[ExceptionType]): Unit = {
-    TestUtils.waitUntilControllerElected(zkClient)
+    if (isKRaftTest()) {
+      TestUtils.waitUntilQuorumLeaderElected(controllerServer)
+    } else {
+      TestUtils.waitUntilControllerElected(zkClient)
+      val versionBefore = updateFeatureZNode(defaultFinalizedFeatures())
+      val nodeBefore = getFeatureZNode()
 
-    updateSupportedFeaturesInAllBrokers(defaultSupportedFeatures())
-    val versionBefore = updateFeatureZNode(defaultFinalizedFeatures())
-    val adminClient = createAdminClient()
-    val nodeBefore = getFeatureZNode()
+      updateSupportedFeaturesInAllBrokers(defaultSupportedFeatures())
 
-    val result = adminClient.updateFeatures(Utils.mkMap(Utils.mkEntry(feature, invalidUpdate)), new UpdateFeaturesOptions())
+      val adminClient = createAdminClient()
 
-    checkException[ExceptionType](result, Map(feature -> exceptionMsgPattern))
-    checkFeatures(
-      adminClient,
-      nodeBefore,
-      defaultFinalizedFeatures(),
-      versionBefore,
-      defaultSupportedFeatures())
+      val result = adminClient.updateFeatures(Utils.mkMap(Utils.mkEntry(feature, invalidUpdate)), new UpdateFeaturesOptions())
+
+      checkException[ExceptionType](result, Map(feature -> exceptionMsgPattern))
+
+      checkFeatures(
+        adminClient,
+        nodeBefore,
+        defaultFinalizedFeatures(),
+        versionBefore,
+        defaultSupportedFeatures())
+    }
   }
 
   /**
    * Tests that an UpdateFeatures request sent to a non-Controller node fails as expected.
    */
-  @Test
+  @ParameterizedTest(name = TestInfoUtils.TestWithParameterizedQuorumName)
+  @ValueSource(strings = Array("zk", "kraft"))
   def testShouldFailRequestIfNotController(): Unit = {
-    TestUtils.waitUntilControllerElected(zkClient)
+    if (isKRaftTest()) {
+      TestUtils.waitUntilQuorumLeaderElected(controllerServer)
+    } else {
+      TestUtils.waitUntilControllerElected(zkClient)
+    }
 
     updateSupportedFeaturesInAllBrokers(defaultSupportedFeatures())
     val versionBefore = updateFeatureZNode(defaultFinalizedFeatures())
@@ -206,7 +224,8 @@ class UpdateFeaturesTest extends BaseRequestTest {
    * Tests that an UpdateFeatures request fails in the Controller, when, for a feature the
    * allowDowngrade flag is not set during a downgrade request.
    */
-  @Test
+  @ParameterizedTest(name = TestInfoUtils.TestWithParameterizedQuorumName)
+  @ValueSource(strings = Array("zk", "kraft"))
   def testShouldFailRequestWhenDowngradeFlagIsNotSetDuringDowngrade(): Unit = {
     val targetMaxVersionLevel = (defaultFinalizedFeatures()("feature_1") - 1).asInstanceOf[Short]
     testWithInvalidFeatureUpdate[InvalidRequestException](
@@ -413,9 +432,14 @@ class UpdateFeaturesTest extends BaseRequestTest {
    * Tests that an UpdateFeatures request succeeds in the Controller, when, the request contains
    * both a valid feature version level upgrade as well as a downgrade request.
    */
-  @Test
+  @ParameterizedTest(name = TestInfoUtils.TestWithParameterizedQuorumName)
+  @ValueSource(strings = Array("zk", "kraft"))
   def testSuccessfulFeatureUpgradeAndDowngrade(): Unit = {
-    TestUtils.waitUntilControllerElected(zkClient)
+    if (isKRaftTest()) {
+      TestUtils.waitUntilQuorumLeaderElected(controllerServer)
+    } else {
+      TestUtils.waitUntilControllerElected(zkClient)
+    }
 
     val supportedFeatures = Features.supportedFeatures(
       Utils.mkMap(
@@ -505,9 +529,15 @@ class UpdateFeaturesTest extends BaseRequestTest {
    * contains an invalid feature version level upgrade and a valid version level downgrade.
    * i.e. expect the downgrade operation to succeed, and the upgrade operation to fail.
    */
-  @Test
+  @ParameterizedTest(name = TestInfoUtils.TestWithParameterizedQuorumName)
+  @ValueSource(strings = Array("zk", "kraft"))
   def testPartialSuccessDuringInvalidFeatureUpgradeAndValidDowngrade(): Unit = {
-    TestUtils.waitUntilControllerElected(zkClient)
+    if (isKRaftTest()) {
+      TestUtils.waitUntilQuorumLeaderElected(controllerServer)
+    } else {
+      TestUtils.waitUntilControllerElected(zkClient)
+    }
+
 
     val controller = servers.filter { server => server.kafkaController.isActive}.head
     val nonControllerServers = servers.filter { server => !server.kafkaController.isActive}
